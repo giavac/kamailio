@@ -25,6 +25,9 @@
 #include <stdlib.h>
 #include <time.h>
 
+#include <openssl/hmac.h>
+#include <openssl/evp.h>
+
 #include "../../core/dprint.h"
 #include "../../core/ut.h"
 #include "../../core/trim.h"
@@ -192,6 +195,56 @@ int authx_xkey_add_params(str *sparam)
 }
 
 /**
+ * Compute the HMAC of data keyed with key, using the digest selected by alg
+ * ("hmac-sha256", "hmac-sha384" or "hmac-sha512"), and write it hex-encoded
+ * (lowercase, NUL-terminated) into out (which must be at least
+ * SHA512_DIGEST_STRING_LENGTH bytes). Returns the length of the hex string
+ * (i.e. SHA*_DIGEST_STRING_LENGTH - 1) on success, -1 on error.
+ */
+static int auth_xkeys_compute_hmac(str *alg, str *key, str *data, char *out)
+{
+	const EVP_MD *evp;
+	unsigned char hmac_raw[EVP_MAX_MD_SIZE];
+	unsigned int hmac_len = 0;
+	int hexlen;
+
+	if(alg->len == 11 && strncasecmp(alg->s, "hmac-sha256", 11) == 0) {
+		evp = EVP_sha256();
+		hexlen = SHA256_DIGEST_STRING_LENGTH - 1;
+	} else if(alg->len == 11 && strncasecmp(alg->s, "hmac-sha384", 11) == 0) {
+		evp = EVP_sha384();
+		hexlen = SHA384_DIGEST_STRING_LENGTH - 1;
+	} else if(alg->len == 11 && strncasecmp(alg->s, "hmac-sha512", 11) == 0) {
+		evp = EVP_sha512();
+		hexlen = SHA512_DIGEST_STRING_LENGTH - 1;
+	} else {
+		LM_ERR("unknown algorithm [%.*s]\n", alg->len, alg->s);
+		return -1;
+	}
+
+	if(HMAC(evp, key->s, key->len, (unsigned char *)data->s, data->len,
+			   hmac_raw, &hmac_len)
+			== NULL) {
+		LM_ERR("hmac computation failed for algorithm [%.*s]\n", alg->len,
+				alg->s);
+		return -1;
+	}
+	if(bytes_to_hex(hmac_raw, hmac_len, out, hexlen + 1) < 0) {
+		LM_ERR("failed to hex-encode hmac output\n");
+		return -1;
+	}
+	return hexlen;
+}
+
+/**
+ * Return 1 if alg selects an HMAC algorithm, 0 otherwise.
+ */
+static int auth_xkeys_is_hmac(str *alg)
+{
+	return (alg->len == 11 && strncasecmp(alg->s, "hmac-", 5) == 0) ? 1 : 0;
+}
+
+/**
  *
  */
 int auth_xkeys_add(sip_msg_t *msg, str *hdr, str *key, str *alg, str *data)
@@ -222,27 +275,34 @@ int auth_xkeys_add(sip_msg_t *msg, str *hdr, str *key, str *alg, str *data)
 	}
 
 	xdata.s = pv_get_buffer();
-	xdata.len = data->len + itc->kvalue.len + 1;
-	if(xdata.len + 1 >= pv_get_buffer_size()) {
-		LM_ERR("size of data and key is too big\n");
-		return -1;
-	}
-
-	strncpy(xdata.s, itc->kvalue.s, itc->kvalue.len);
-	xdata.s[itc->kvalue.len] = ':';
-	strncpy(xdata.s + itc->kvalue.len + 1, data->s, data->len);
-	if(alg->len == 6 && strncasecmp(alg->s, "sha256", 6) == 0) {
-		compute_sha256(xout, (u_int8_t *)xdata.s, xdata.len);
-		xdata.len = SHA256_DIGEST_STRING_LENGTH - 1;
-	} else if(alg->len == 6 && strncasecmp(alg->s, "sha384", 6) == 0) {
-		compute_sha384(xout, (u_int8_t *)xdata.s, xdata.len);
-		xdata.len = SHA384_DIGEST_STRING_LENGTH - 1;
-	} else if(alg->len == 6 && strncasecmp(alg->s, "sha512", 6) == 0) {
-		compute_sha512(xout, (u_int8_t *)xdata.s, xdata.len);
-		xdata.len = SHA512_DIGEST_STRING_LENGTH - 1;
+	if(auth_xkeys_is_hmac(alg)) {
+		int hexlen = auth_xkeys_compute_hmac(alg, &itc->kvalue, data, xout);
+		if(hexlen < 0)
+			return -1;
+		xdata.len = hexlen;
 	} else {
-		LM_ERR("unknown algorithm [%.*s]\n", alg->len, alg->s);
-		return -1;
+		xdata.len = data->len + itc->kvalue.len + 1;
+		if(xdata.len + 1 >= pv_get_buffer_size()) {
+			LM_ERR("size of data and key is too big\n");
+			return -1;
+		}
+
+		strncpy(xdata.s, itc->kvalue.s, itc->kvalue.len);
+		xdata.s[itc->kvalue.len] = ':';
+		strncpy(xdata.s + itc->kvalue.len + 1, data->s, data->len);
+		if(alg->len == 6 && strncasecmp(alg->s, "sha256", 6) == 0) {
+			compute_sha256(xout, (u_int8_t *)xdata.s, xdata.len);
+			xdata.len = SHA256_DIGEST_STRING_LENGTH - 1;
+		} else if(alg->len == 6 && strncasecmp(alg->s, "sha384", 6) == 0) {
+			compute_sha384(xout, (u_int8_t *)xdata.s, xdata.len);
+			xdata.len = SHA384_DIGEST_STRING_LENGTH - 1;
+		} else if(alg->len == 6 && strncasecmp(alg->s, "sha512", 6) == 0) {
+			compute_sha512(xout, (u_int8_t *)xdata.s, xdata.len);
+			xdata.len = SHA512_DIGEST_STRING_LENGTH - 1;
+		} else {
+			LM_ERR("unknown algorithm [%.*s]\n", alg->len, alg->s);
+			return -1;
+		}
 	}
 
 	if(xdata.len + hdr->len + 6 >= pv_get_buffer_size()) {
@@ -333,6 +393,18 @@ int auth_xkeys_check(sip_msg_t *msg, str *hdr, str *key, str *alg, str *data)
 	}
 	xdata.s = pv_get_buffer();
 	for(; itc; itc = itc->next) {
+		if(auth_xkeys_is_hmac(alg)) {
+			int hexlen = auth_xkeys_compute_hmac(alg, &itc->kvalue, data, xout);
+			if(hexlen < 0)
+				return -1;
+			if(hbody.len == hexlen
+					&& strncasecmp(xout, hbody.s, hbody.len) == 0) {
+				LM_DBG("hmac [%.*s] matched for key [%.*s:%.*s]\n", alg->len,
+						alg->s, key->len, key->s, itc->kname.len, itc->kname.s);
+				return 0;
+			}
+			continue;
+		}
 		xdata.len = data->len + itc->kvalue.len + 1;
 		if(xdata.len + 1 >= pv_get_buffer_size()) {
 			LM_WARN("size of data and key is too big - ignoring\n");

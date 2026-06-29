@@ -154,7 +154,18 @@ modparam("auth_xkeys", "xkey", "id=abc;name=xyz;value=secret;expires=72000")
 		include variables.
 		</para>
 		<para>
-		The algorithm can be: sha256, sha384, sha512.
+		The algorithm can be: sha256, sha384, sha512, hmac-sha256,
+		hmac-sha384, hmac-sha512.
+		</para>
+		<para>
+		For the sha256/sha384/sha512 algorithms the digest is computed over the
+		concatenation of the key value and data (key value, a colon and data).
+		For the hmac-sha256/hmac-sha384/hmac-sha512 algorithms an HMAC
+		(RFC 2104) is computed over data, keyed with the key value. The HMAC
+		variants are recommended, because the plain sha* construction is
+		vulnerable to length-extension attacks. In all cases the result is
+		stored as a lowercase hex string, so the produced header value has the
+		same size as with the corresponding sha* algorithm.
 		</para>
 		<para>
 		This function can be used from ANY_ROUTE.
@@ -179,7 +190,10 @@ auth_xkeys_add("X-My-Key", "abc", "sha256", "$Ri:$fu:$ru:$hdr(CSeq)");
 		of parameter data. The parameters can include variables.
 		</para>
 		<para>
-		The algorithm can be: sha256, sha384, sha512.
+		The algorithm can be: sha256, sha384, sha512, hmac-sha256,
+		hmac-sha384, hmac-sha512. See the description of
+		<function>auth_xkeys_add()</function> for the meaning of each
+		algorithm.
 		</para>
 		<para>
 		Note that the header is not removed by the function, it is recommended
