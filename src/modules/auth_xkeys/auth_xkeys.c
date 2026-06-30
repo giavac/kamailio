@@ -27,6 +27,7 @@
 
 #include <openssl/hmac.h>
 #include <openssl/evp.h>
+#include <openssl/crypto.h>
 
 #include "../../core/dprint.h"
 #include "../../core/ut.h"
@@ -196,16 +197,16 @@ int authx_xkey_add_params(str *sparam)
 
 /**
  * Compute the HMAC of data keyed with key, using the digest selected by alg
- * ("hmac-sha256", "hmac-sha384" or "hmac-sha512"), and write it hex-encoded
- * (lowercase, NUL-terminated) into out (which must be at least
- * SHA512_DIGEST_STRING_LENGTH bytes). Returns the length of the hex string
+ * ("hmac-sha256", "hmac-sha384" or "hmac-sha512"). The raw HMAC is written to
+ * raw_out (which must be at least EVP_MAX_MD_SIZE bytes) and its length to
+ * raw_len. Returns the length of the corresponding hex string
  * (i.e. SHA*_DIGEST_STRING_LENGTH - 1) on success, -1 on error.
  */
-static int auth_xkeys_compute_hmac(str *alg, str *key, str *data, char *out)
+static int auth_xkeys_compute_hmac(
+		str *alg, str *key, str *data, unsigned char *raw_out,
+		unsigned int *raw_len)
 {
 	const EVP_MD *evp;
-	unsigned char hmac_raw[EVP_MAX_MD_SIZE];
-	unsigned int hmac_len = 0;
 	int hexlen;
 
 	if(alg->len == 11 && strncasecmp(alg->s, "hmac-sha256", 11) == 0) {
@@ -222,15 +223,18 @@ static int auth_xkeys_compute_hmac(str *alg, str *key, str *data, char *out)
 		return -1;
 	}
 
-	if(HMAC(evp, key->s, key->len, (unsigned char *)data->s, data->len,
-			   hmac_raw, &hmac_len)
+	*raw_len = 0;
+	if(HMAC(evp, key->s, key->len, (unsigned char *)data->s, data->len, raw_out,
+			   raw_len)
 			== NULL) {
 		LM_ERR("hmac computation failed for algorithm [%.*s]\n", alg->len,
 				alg->s);
 		return -1;
 	}
-	if(bytes_to_hex(hmac_raw, hmac_len, out, hexlen + 1) < 0) {
-		LM_ERR("failed to hex-encode hmac output\n");
+	/* sanity check: hex form must match the expected digest size */
+	if((int)(2 * (*raw_len)) != hexlen) {
+		LM_ERR("unexpected hmac length %u for algorithm [%.*s]\n", *raw_len,
+				alg->len, alg->s);
 		return -1;
 	}
 	return hexlen;
@@ -276,9 +280,17 @@ int auth_xkeys_add(sip_msg_t *msg, str *hdr, str *key, str *alg, str *data)
 
 	xdata.s = pv_get_buffer();
 	if(auth_xkeys_is_hmac(alg)) {
-		int hexlen = auth_xkeys_compute_hmac(alg, &itc->kvalue, data, xout);
+		unsigned char hmac_raw[EVP_MAX_MD_SIZE];
+		unsigned int raw_len = 0;
+		int hexlen =
+				auth_xkeys_compute_hmac(alg, &itc->kvalue, data, hmac_raw,
+						&raw_len);
 		if(hexlen < 0)
 			return -1;
+		if(bytes_to_hex(hmac_raw, raw_len, xout, hexlen + 1) < 0) {
+			LM_ERR("failed to hex-encode hmac output\n");
+			return -1;
+		}
 		xdata.len = hexlen;
 	} else {
 		xdata.len = data->len + itc->kvalue.len + 1;
@@ -394,11 +406,26 @@ int auth_xkeys_check(sip_msg_t *msg, str *hdr, str *key, str *alg, str *data)
 	xdata.s = pv_get_buffer();
 	for(; itc; itc = itc->next) {
 		if(auth_xkeys_is_hmac(alg)) {
-			int hexlen = auth_xkeys_compute_hmac(alg, &itc->kvalue, data, xout);
+			unsigned char hmac_raw[EVP_MAX_MD_SIZE];
+			unsigned char hbody_raw[EVP_MAX_MD_SIZE];
+			char hbody_hex[SHA512_DIGEST_STRING_LENGTH];
+			unsigned int raw_len = 0;
+			int hexlen = auth_xkeys_compute_hmac(
+					alg, &itc->kvalue, data, hmac_raw, &raw_len);
 			if(hexlen < 0)
 				return -1;
-			if(hbody.len == hexlen
-					&& strncasecmp(xout, hbody.s, hbody.len) == 0) {
+			if(hbody.len != hexlen) {
+				/* header digest size does not match this algorithm */
+				continue;
+			}
+			/* hex_to_bytes() needs a NUL-terminated string and tolerates
+			 * either case; decode the header and compare the raw bytes in
+			 * constant time to avoid a timing oracle on MAC verification */
+			memcpy(hbody_hex, hbody.s, hbody.len);
+			hbody_hex[hbody.len] = '\0';
+			if(hex_to_bytes(hbody_hex, hbody_raw, sizeof(hbody_raw))
+							== (int)raw_len
+					&& CRYPTO_memcmp(hbody_raw, hmac_raw, raw_len) == 0) {
 				LM_DBG("hmac [%.*s] matched for key [%.*s:%.*s]\n", alg->len,
 						alg->s, key->len, key->s, itc->kname.len, itc->kname.s);
 				return 0;
