@@ -196,56 +196,54 @@ int authx_xkey_add_params(str *sparam)
 }
 
 /**
- * Compute the HMAC of data keyed with key, using the digest selected by alg
- * ("hmac-sha256", "hmac-sha384" or "hmac-sha512"). The raw HMAC is written to
- * raw_out (which must be at least EVP_MAX_MD_SIZE bytes) and its length to
- * raw_len. Returns the length of the corresponding hex string
- * (i.e. SHA*_DIGEST_STRING_LENGTH - 1) on success, -1 on error.
+ * Classify the algorithm name as an HMAC algorithm. Any name starting with
+ * the "hmac-" prefix is treated as a request for HMAC; the supported suffixes
+ * are sha256, sha384 and sha512. On a supported name *evp is set to the digest
+ * and *hexlen to the length of its hex representation
+ * (SHA*_DIGEST_STRING_LENGTH - 1).
+ *
+ * Returns:
+ *   1  alg is a supported hmac-* algorithm (*evp and *hexlen are set)
+ *   0  alg is not an hmac-* name (the legacy sha* handling applies)
+ *  -1  alg has the hmac- prefix but the digest is not supported
  */
-static int auth_xkeys_compute_hmac(
-		str *alg, str *key, str *data, unsigned char *raw_out,
-		unsigned int *raw_len)
+static int auth_xkeys_hmac_alg(str *alg, const EVP_MD **evp, int *hexlen)
 {
-	const EVP_MD *evp;
-	int hexlen;
+	if(alg->len < 5 || strncasecmp(alg->s, "hmac-", 5) != 0)
+		return 0;
 
-	if(alg->len == 11 && strncasecmp(alg->s, "hmac-sha256", 11) == 0) {
-		evp = EVP_sha256();
-		hexlen = SHA256_DIGEST_STRING_LENGTH - 1;
-	} else if(alg->len == 11 && strncasecmp(alg->s, "hmac-sha384", 11) == 0) {
-		evp = EVP_sha384();
-		hexlen = SHA384_DIGEST_STRING_LENGTH - 1;
-	} else if(alg->len == 11 && strncasecmp(alg->s, "hmac-sha512", 11) == 0) {
-		evp = EVP_sha512();
-		hexlen = SHA512_DIGEST_STRING_LENGTH - 1;
+	if(alg->len == 11 && strncasecmp(alg->s + 5, "sha256", 6) == 0) {
+		*evp = EVP_sha256();
+		*hexlen = SHA256_DIGEST_STRING_LENGTH - 1;
+	} else if(alg->len == 11 && strncasecmp(alg->s + 5, "sha384", 6) == 0) {
+		*evp = EVP_sha384();
+		*hexlen = SHA384_DIGEST_STRING_LENGTH - 1;
+	} else if(alg->len == 11 && strncasecmp(alg->s + 5, "sha512", 6) == 0) {
+		*evp = EVP_sha512();
+		*hexlen = SHA512_DIGEST_STRING_LENGTH - 1;
 	} else {
-		LM_ERR("unknown algorithm [%.*s]\n", alg->len, alg->s);
+		LM_ERR("unsupported hmac algorithm [%.*s]\n", alg->len, alg->s);
 		return -1;
 	}
+	return 1;
+}
 
+/**
+ * Compute the HMAC of data keyed with key, using the digest evp. The raw HMAC
+ * is written to raw_out (which must be at least EVP_MAX_MD_SIZE bytes) and its
+ * length to raw_len. Returns 0 on success, -1 on error.
+ */
+static int auth_xkeys_compute_hmac(const EVP_MD *evp, str *key, str *data,
+		unsigned char *raw_out, unsigned int *raw_len)
+{
 	*raw_len = 0;
 	if(HMAC(evp, key->s, key->len, (unsigned char *)data->s, data->len, raw_out,
 			   raw_len)
 			== NULL) {
-		LM_ERR("hmac computation failed for algorithm [%.*s]\n", alg->len,
-				alg->s);
+		LM_ERR("hmac computation failed\n");
 		return -1;
 	}
-	/* sanity check: hex form must match the expected digest size */
-	if((int)(2 * (*raw_len)) != hexlen) {
-		LM_ERR("unexpected hmac length %u for algorithm [%.*s]\n", *raw_len,
-				alg->len, alg->s);
-		return -1;
-	}
-	return hexlen;
-}
-
-/**
- * Return 1 if alg selects an HMAC algorithm, 0 otherwise.
- */
-static int auth_xkeys_is_hmac(str *alg)
-{
-	return (alg->len == 11 && strncasecmp(alg->s, "hmac-", 5) == 0) ? 1 : 0;
+	return 0;
 }
 
 /**
@@ -255,9 +253,13 @@ int auth_xkeys_add(sip_msg_t *msg, str *hdr, str *key, str *alg, str *data)
 {
 	str xdata;
 	auth_xkey_t *itc;
+	/* fits the largest hex digest (SHA-512: 128 chars) plus the NUL */
 	char xout[SHA512_DIGEST_STRING_LENGTH];
 	struct lump *anchor;
 	char *p;
+	const EVP_MD *evp = NULL;
+	int hexlen = 0;
+	int hmret;
 
 	if(_auth_xkeys_list == NULL || *_auth_xkeys_list == NULL) {
 		LM_ERR("no stored keys\n");
@@ -278,14 +280,16 @@ int auth_xkeys_add(sip_msg_t *msg, str *hdr, str *key, str *alg, str *data)
 		return -1;
 	}
 
+	hmret = auth_xkeys_hmac_alg(alg, &evp, &hexlen);
+	if(hmret < 0)
+		return -1;
+
 	xdata.s = pv_get_buffer();
-	if(auth_xkeys_is_hmac(alg)) {
+	if(hmret > 0) {
 		unsigned char hmac_raw[EVP_MAX_MD_SIZE];
 		unsigned int raw_len = 0;
-		int hexlen =
-				auth_xkeys_compute_hmac(alg, &itc->kvalue, data, hmac_raw,
-						&raw_len);
-		if(hexlen < 0)
+		if(auth_xkeys_compute_hmac(evp, &itc->kvalue, data, hmac_raw, &raw_len)
+				< 0)
 			return -1;
 		if(bytes_to_hex(hmac_raw, raw_len, xout, hexlen + 1) < 0) {
 			LM_ERR("failed to hex-encode hmac output\n");
@@ -362,6 +366,9 @@ int auth_xkeys_check(sip_msg_t *msg, str *hdr, str *key, str *alg, str *data)
 	auth_xkey_t *itc;
 	char xout[SHA512_DIGEST_STRING_LENGTH];
 	str hbody;
+	const EVP_MD *evp = NULL;
+	int hexlen = 0;
+	int hmret;
 
 	if(_auth_xkeys_list == NULL || *_auth_xkeys_list == NULL) {
 		LM_ERR("no stored keys\n");
@@ -403,21 +410,28 @@ int auth_xkeys_check(sip_msg_t *msg, str *hdr, str *key, str *alg, str *data)
 		LM_DBG("no key chain id [%.*s]\n", key->len, key->s);
 		return -1;
 	}
+	hmret = auth_xkeys_hmac_alg(alg, &evp, &hexlen);
+	if(hmret < 0)
+		return -1;
+	/* the header digest size is loop-invariant; if it cannot match the
+	 * requested hmac algorithm there is no point scanning the keys */
+	if(hmret > 0 && hbody.len != hexlen) {
+		LM_DBG("header digest size does not match algorithm [%.*s]\n", alg->len,
+				alg->s);
+		return -1;
+	}
+
 	xdata.s = pv_get_buffer();
 	for(; itc; itc = itc->next) {
-		if(auth_xkeys_is_hmac(alg)) {
+		if(hmret > 0) {
 			unsigned char hmac_raw[EVP_MAX_MD_SIZE];
 			unsigned char hbody_raw[EVP_MAX_MD_SIZE];
 			char hbody_hex[SHA512_DIGEST_STRING_LENGTH];
 			unsigned int raw_len = 0;
-			int hexlen = auth_xkeys_compute_hmac(
-					alg, &itc->kvalue, data, hmac_raw, &raw_len);
-			if(hexlen < 0)
+			if(auth_xkeys_compute_hmac(evp, &itc->kvalue, data, hmac_raw,
+					   &raw_len)
+					< 0)
 				return -1;
-			if(hbody.len != hexlen) {
-				/* header digest size does not match this algorithm */
-				continue;
-			}
 			/* hex_to_bytes() needs a NUL-terminated string and tolerates
 			 * either case; decode the header and compare the raw bytes in
 			 * constant time to avoid a timing oracle on MAC verification */
